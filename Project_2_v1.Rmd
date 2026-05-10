@@ -1,0 +1,439 @@
+---
+title: "Project 2 Data 624"
+author: "Samantha Barbaro, Catherine Dube, Luis Hernandez"
+date: "2026-05-06"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+# Project 2
+
+## Importing the data
+
+```{r}
+library(tidyverse)
+library(VIM)
+
+test_data <- read.csv("https://raw.githubusercontent.com/samanthabarbaro/data624/refs/heads/main/testdataproj2.csv", na.strings = c("", "NA", "null", "NULL"),  header = TRUE)
+
+training_data <- read.csv("https://raw.githubusercontent.com/samanthabarbaro/data624/refs/heads/main/trainingdataproj2.csv", na.strings = c("", "NA", "null", "NULL"),  header = TRUE)
+```
+
+```{r}
+glimpse(test_data)
+glimpse(training_data)
+str(training_data)
+```
+
+All the rows with numbers are formatted as numbers. All the variables are numeric except for brand code, likely the only categorical variable.
+
+## Exploring the data
+
+We'll look at:
+
+- The number of cases
+
+- Missing values
+
+- Data types (numerical vs. categorical)
+
+### Number of cases
+
+```{r}
+
+nrow(training_data)
+nrow(test_data)
+```
+
+The training data has 2571 cases and the test data has 267.
+
+### Variables
+
+Counting the number of columns/variables:
+
+```{r}
+
+ncol(test_data)
+ncol(training_data)
+```
+
+Both data sets have 33 columns.
+
+Are all the variables represented in both data sets?
+
+```{r}
+colnames(test_data) 
+colnames(training_data)
+```
+
+Both data sets have the same columns, so we can proceed.
+
+### Missing data
+
+How many missing values are there? Are there any trends? How many complete cases are there?
+
+#### Test data
+
+Count nulls/missing values in the test data:
+
+```{r}
+
+sort(colSums(is.na(test_data)), decreasing = TRUE)
+
+```
+
+First off, all the **pH values are missing**. This is not a test set —it's what we will predict. The training data will have to be split on its own into a training and test set.
+
+Most columns are missing a few (under 10) values or none at all. MFR is missing the most values – 31 out of 267, or about 12%. Filler speed is next, missing only 10 values.
+
+Next, we'll look at the data row-wise and see if there are full or close-to-full missing cases.
+
+```{r}
+
+rowSums(is.na(test_data))
+
+
+#totals by row (1 does not count)
+table(rowSums(is.na(test_data)))
+
+
+#total NAs (subtracting 267 for the missing pH values)
+sum(is.na(test_data)) - 267
+
+
+```
+
+Overall, a data set with 267 rows and 33 columns is missing 107 values, or about 1.3%. 67 out of 267 cases are missing at least one value (about 25%).
+
+One case has 14 missing values, so it may make sense to drop that; another is missing 8. Otherwise, most rows with missing values are missing only 1-3.
+
+#### Training data
+
+Which variables are missing data?
+
+```{r}
+
+sort(colSums(is.na(training_data)), decreasing = TRUE)
+
+```
+
+MFR is missing 212 out of 2571 cases, about 8.2%. Brand code, the only categorical variable, is missing 120 times, or about 4.7% of the time. Filler speed is missing 57 times, about 2.2%, and everything else is under 2%.
+
+Let's see if anything strange is happening across rows:
+
+```{r}
+
+#nothing out of the ordinary across rows. Most rows are complete.
+#Rows with NAs typically 1 or 2 NAs, wich
+rowSums(is.na(training_data))
+table(rowSums(is.na(training_data)))
+
+
+sum(is.na(test_data))
+
+
+```
+
+Overall, 374 values are missing (about 14.5% total missingness). 2038/2571 cases are complete. That's about 79%; 21% of cases are incomplete. Let's also check to see if the data is MCAR.
+
+```{r, warning=FALSE}
+library(naniar)
+numeric_only <- training_data |>
+  select(-Brand.Code)
+
+numeric_only <- numeric_only |>
+  dplyr::select(where(is.numeric)) |>
+  mutate(across(everything(), as.double))
+
+mcar_test(numeric_only)
+```
+
+The p-value is 0, which means the data most likely isn't missing completely at random (there are patterns in the missing data).
+
+## Data cleaning
+
+We'll cover:
+
+- Variables with zero or near-zero variance
+
+- Highly correlated variables
+
+- Outliers/range of variables/scaling (if needed)
+
+### Checking for variables with near-zero or zero variance
+
+This data set has 33 variables. Let's check to see if they're all (potentially) providing useful predictive information by testing for near-zero or zero variance.
+
+```{r}
+library(caret)
+nzv_results <- nearZeroVar(training_data, saveMetrics = TRUE)
+
+nzv_results
+```
+
+Hyd.Pressure1 has a near-zero variance, so we could eliminate that one.
+
+### Looking for highly correlated variables
+
+We'll create a correlation grid, so we can see actual correlation between variables. We'll also create a correlation plot and use findCorrelation from the caret package to find variables that have 90% or higher correlation.
+
+```{r}
+correlation_grid <- training_data |> 
+  drop_na() |>
+  select(-Brand.Code) |>
+  cor()
+
+correlation_grid <- as.data.frame(correlation_grid)
+
+correlation_grid
+```
+
+There are many highly correlated variables. A quick scan shows:
+
+- hyd.pressure 2 and 3 have a .91 correlation
+
+- filler.level and bowl.set.point have a .98 correlation
+
+- fillers.speed and MFR have a .95 correlation
+
+- density and balling.lvl have a .95 correlation
+
+- balling and balling.lvl have a .98 correlation; both are strongly correlated with density and alch rel.
+
+- alch.rel and balling.lvl have a .95 correlation; it also has a .95 correlation with balling, balling.lvl, and .93 with density
+
+Here's a correlation plot so we can see all the positively and negatively correlated variables:
+
+```{r}
+library(corrplot)
+
+grid <- training_data |> 
+  drop_na() |> 
+  select(-Brand.Code) |> 
+  cor()
+
+corrplot(cor(grid),method = "square")
+
+```
+
+There are many negatively correlated variables here that do not need to be removed, but may be helpful for analysis. We can see that the response variable, pH, has a strong negative correlation with some variables, including fill.pressure1, usage.cont, and Air.Pressurer.
+
+The findCorrelation feature will decide which variables to drop (it leaves the variable that best represents the group):
+
+```{r}
+library(caret)
+
+#if we remove colinear variables at 95% correlation, we would drop 10 variables
+indexestodrop95 <- findCorrelation(cor(grid), cutoff = 0.95)
+colnames(grid)[indexestodrop95]
+
+#this will leave us with 22 predictor variables and the response variable.
+
+#if we remove colinear variables at 90% correlation, we would drop 12 variables
+indexestodrop90 <- findCorrelation(cor(grid), cutoff = 0.90)
+colnames(grid)[indexestodrop90]
+
+#this will leave us with 20 predictor variables and the response variable.
+```
+
+### Removing variables
+
+Removing some of the 33 variables will help simplify this data set. We will remove the variable with NZV and highly colinear variables (greater than or about .90, as defined above).
+
+the findcorrelation function says to drop Filler.Speed instead of MFR. However, we will opt to drop MFR instead, given that it has the highest number of missing values (filler.speed has 57 as opposed to MFR's 212). Having to impute all these values will makes the variable less reliable, and dropping it would mean having to drop more cases.
+
+```{r}
+#removing the variable with NZV
+training_data_new <- training_data |>
+  select(-Hyd.Pressure1)
+
+#removing correlated variables
+training_data_new <- training_data_new |>
+  select(-Pressure.Setpoint, -MFR, -Hyd.Pressure3,
+         -Pressure.Vacuum, -Hyd.Pressure4, -Bowl.Setpoint, -Carb.Rel, 
+         -Balling, -Alch.Rel, - Balling.Lvl, - Density)
+
+#donig the same for the test set
+test_data_new <- test_data |>
+  select(-Hyd.Pressure1, -Pressure.Setpoint, -MFR, -Hyd.Pressure3,
+         -Pressure.Vacuum, -Hyd.Pressure4, -Bowl.Setpoint, -Carb.Rel, 
+         -Balling, -Alch.Rel, - Balling.Lvl, - Density)
+```
+
+### Checking for outliers
+
+Before we deal with missing values, let's see if there are any glaring outliers or data entry errors.
+
+```{r}
+#may be an outlier in oxygen filler - the max calues is much higher than the 
+
+summary(test_data_new)
+
+#there's also at least one really large value on oxygen filler here
+summary(training_data_new)
+
+```
+
+After quickly browsing the remaining variables, while some of the fields have a wide range of values, none of the values look like errors (there are clusters of similar low/high values for each variable). While they may count as outliers (we'll calculate later) they are likely legitimate data ant not input errors.
+
+Let's check histograms to see if anything stands out:
+
+```{r, echo=FALSE, fig.width=20, fig.height=15}
+#all remaining variables (minus brand code) 
+training_data_new |>
+    pivot_longer(where(is.numeric)) |>
+  drop_na(value) |>
+    ggplot(aes(x = value)) +
+    geom_histogram() +
+    facet_wrap(~ name, scales = "free")
+
+
+training_data_new |> count(Brand.Code)
+
+```
+
+Not all the data is normally distributed. pH, the response variable is normally distributed. Other variables close to a normal distribution include carb pressure, carb pressure 1 (slightly bimodal), carb temp, fill ounces, carb volume (also slightly bimodal), psc (skewed slightly right), pc volume, temperature (skewed slightly right), and psc fill (skewed right with a large peak).
+
+A few are more clearly bimodal/have very different peaks on either side of the graph: air pressurer, carb flow, fill pressure, filler level, filler speed, , hyd pressure 2, mnf flow, and usage cont.
+
+Finally, some are skewed right: in addition to the varaibles mentioned above, oxygen filler looks like it may have some outliers, and psc co2 has a strange distribution, where the variable clusters around certain values, almost like a discrete variable.
+
+```{r}
+#histograms
+
+for (col in names(training_data_new %>% select(-Brand.Code))) {
+  hist(training_data_new[[col]], main=col)
+}
+
+#box plots 
+for (col in names(training_data_new %>% select(-Brand.Code))) {
+  boxplot(training_data_new[[col]], main=col)
+}
+
+```
+
+Calculating the number of outliers in each column based on the IQR method
+
+```{r}
+outliers <- sapply(training_data_new |> select(-Brand.Code), function(x) {
+  Q1 <- quantile(x, 0.25, na.rm=TRUE)
+  Q3 <- quantile(x, 0.75, na.rm=TRUE)
+  IQR <- Q3 - Q1
+  sum(x < Q1 - 1.5*IQR | x > Q3 + 1.5*IQR, na.rm=TRUE)
+})
+outliers
+```
+
+Cross-checking the graphs with the data set, we could remove the one Filler.Level value that appears on the top of the box plot, 161.2 when the next-highest is 154. pH has one comparatively high value (9.36) that's nowhere close to the next-highest value. We can remove that row - it's missing 4 other variables. Other outlier values are one of several similar values, and could be categorized that way due to the shape of the distribution and wide range of values. For example, it looks like there's one particularly high value for Oxygen.Filler, but when we check there are 5 cases with the same value.
+
+```{r}
+#removing the one outliers
+training_data_new <- training_data_new |>
+  filter(PH < 9 | is.na(PH)) |>
+  filter(Filler.Level < 160 | is.na(Filler.Level)) 
+
+#removing pH NAs because we shouldn't impute the response variable
+training_data_no_na <- training_data_new |> 
+  filter(!is.na(PH))
+```
+
+### Looking at outliers in the test data set
+
+```{r}
+#leaving out the categorical and blank response variable
+for (col in names(test_data_new %>% select(-Brand.Code, -PH))) {
+  boxplot(test_data_new[[col]], main=col)
+}
+
+test_data_new |> count(Brand.Code)
+
+```
+
+Oxygen filler shows up again with a few outliers, which just seems to be the case for this variable; the outliers in filler speed are all clustered; filler level has outliers on both ends, as does fill pressure. Carb.pressure1 has one high value, PSC.CO2 has a few higher values designated outliers due to the clustering on the lower end, same is true for PSC.Fill, and the rest are similar.
+
+We won't remove any of these because they don't look like errors, and in some cases represent a different, smaller cluster of values.
+
+## Dealing with missing values
+
+```{r}
+sum(is.na(training_data_no_na))
+sort(colSums(is.na(training_data_no_na)), decreasing = TRUE)
+
+#checking the number of complete cases
+table(rowSums(is.na(training_data_no_na)))
+
+```
+
+516 missing values across 2566 cases and 21 variables  - 516/53886 is about .9% overall missingness, which is very low. Notably, brand code is missing in 120 cases.
+
+2169 cases our of 2566 are complete, or about 85%. If we dropped all NAs, we would be dropping 15% of the data. Instead, we will use the VIM package for simple KNN imputation. This package just fills in the nearest neighbor-–it doesn't change the other variables. Vim can handle categorical variables, like brand code. We'll use K=5.
+
+```{r}
+
+training_data_imputed <- kNN(training_data_no_na, k = 5)
+
+#making sure it worked
+sum(is.na(training_data_imputed))
+
+```
+
+#### Imputing values for the test data
+
+First, let's check how many missing values there are after we've removed columns in the test data.
+
+```{r}
+
+table(rowSums(is.na(test_data_new)))
+
+colSums(is.na(test_data_new))
+
+#total NAs (subtracting 267 for the missing pH values)
+sum(is.na(test_data_new)) - 267
+
+```
+
+Now there are only 60 missing values total. 42 rows have missing values. One row has 8 missing values (the one that had 14 before). Let's remove that:
+
+```{r}
+test_data_new <- test_data_new[rowSums(is.na(test_data_new)) != 9, ]
+
+#confirming that only one value was removed
+count(test_data_new)
+```
+
+Imputing with the same method we used for the training data:
+
+```{r}
+#list all columns except PH
+cols_to_impute <- setdiff(colnames(test_data_new), "PH")
+
+test_data_imputed <- kNN(test_data_new, variable = cols_to_impute, k = 5)
+
+#we should get 266 cases
+sum(is.na(test_data_imputed))
+
+```
+
+## Break into training and test data
+
+Breaking the training data set into an 80%/20% training and test set:
+
+```{r}
+set.seed(1122)
+
+train_index <- sample(nrow(training_data_imputed),
+                      0.8 * nrow(training_data_imputed))
+
+#create a training set
+train_y <- training_data_imputed$PH[train_index]
+train_x <- training_data_imputed[train_index, ] |> dplyr::select(-PH)
+
+#test set
+test_y <- training_data_imputed$PH[-train_index]
+test_x  <- training_data_imputed[-train_index, ] |> dplyr::select(-PH)
+```
+
+### Centering and scaling
+
+I did not scale anything individually, every package should have an option to center/scale automatically, and use a Box-Cox for the data with less normal distributions.
