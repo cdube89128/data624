@@ -34,7 +34,8 @@ pacman::p_load(
    VIM,
    naniar,
    corrplot,
-   caret
+   caret,
+   RANN
 )
 
 projPath <- if (interactive()) {
@@ -52,9 +53,9 @@ projPath <- if (interactive()) {
 library(tidyverse)
 library(VIM)
 
-test_data <- read.csv("https://raw.githubusercontent.com/samanthabarbaro/data624/refs/heads/main/testdataproj2.csv", na.strings = c("", "NA", "null", "NULL"),  header = TRUE)
+test_data <- read.csv(file.path(projPath, "testdataproj2.csv"), na.strings = c("", "NA", "null", "NULL"),  header = TRUE)
 
-training_data <- read.csv("https://raw.githubusercontent.com/samanthabarbaro/data624/refs/heads/main/trainingdataproj2.csv", na.strings = c("", "NA", "null", "NULL"),  header = TRUE)
+training_data <- read.csv(file.path(projPath, "trainingdataproj2.csv"), na.strings = c("", "NA", "null", "NULL"),  header = TRUE)
 ```
 
 ```{r}
@@ -579,7 +580,203 @@ Before fitting models, a few setup decisions worth flagging up front.
 
 **Imputation inside resampling.** The earlier `kNN(k = 5)` chunk produced `training_data_imputed` as a one-time inspection step, useful for seeing what imputation does to the data and for the quick 80/20 sanity-check split. For the actual model fitting, however, we start from `training_data_no_na` (the pre-imputation intermediate) and let caret handle imputation inside each CV fold via `preProcess(method = c("knnImpute", "BoxCox", "center", "scale"))` paired with `trainControl(method = "repeatedcv", number = 10, repeats = 5)`. That way the imputation parameters are estimated per fold rather than once on the full training set, which avoids the small bias from imputing before the split.
 
+**Brand.Code handling.** Rather than imputing the 120 missing brand values, we treat missing as its own factor level called `"Unknown"`. The EDA section established that the missing-Brand rows have a different PH profile from known-Brand rows, so the missingness itself carries signal worth preserving.
+
+**Shared infrastructure for the model comparison.** Every model we fit shares the same `controlObject` (10-fold CV, 5 repeats) and is trained immediately after `set.seed(624)`. Together that guarantees identical CV folds across models, which is what `resamples()` requires for valid side-by-side comparisons later. Each fitted model also gets appended to a `models` list so the final comparison can drop in cleanly.
+
+```{r setup-modeling}
+library(caret)
+
+set.seed(624)
+
+# treat Brand.Code NAs as their own factor level (informative-missingness signal from EDA)
+training_for_modeling <- training_data_no_na %>%
+  mutate(Brand.Code = factor(ifelse(is.na(Brand.Code) | Brand.Code == "", "Unknown", Brand.Code)))
+
+# shared control object for every model. Sharing this AND seeding with set.seed(624)
+# right before each train() call keeps the CV folds identical across models.
+controlObject <- trainControl(method = "repeatedcv", number = 10, repeats = 5,
+                              savePredictions = "final")
+
+# named list to accumulate fitted models for the final resamples() comparison
+models <- list()
+
+# running table of CV metrics; each model section appends one row after fitting
+model_metrics <- tibble(model = character(),
+                        cv_RMSE = numeric(),
+                        cv_Rsquared = numeric(),
+                        cv_MAE = numeric())
+```
+
+**Per-model output pattern.** To keep model sections comparable across the rest of this report, each one produces the same chunks in the same order. Teammates adding a new model should follow this pattern:
+
+1. Train the model with `set.seed(624)` and the shared `controlObject`. Print the trained object so caret shows CV RMSE / R-squared / MAE. Append `getTrainPerf(model)` to `model_metrics` so the final comparison table builds itself.
+2. `plot(varImp(model), top = 20)`: which predictors matter most.
+3. *Linear-family only:* a coefficient table sorted by absolute t-statistic (gives direction + strength of each predictor's effect on PH). Tree-based and rule-based models skip this.
+4. A small residual summary table (mean, SD, max |residual|, plus predicted vs observed range so we can see range compression).
+
 ### Recap
 
 - Linear-family + NN models get the 20-predictor narrow set; tree-based + rule-based models get the 31-predictor wide set.
 - The pre-imputed `training_data_imputed` is an inspection / sanity-check artifact for imputation. The actual model fitting starts from the pre-imputation data (`training_data_no_na`) and lets caret impute inside each CV fold for honest performance metrics.
+- Brand.Code missing values kept as an "Unknown" factor level rather than imputed.
+- All models share `controlObject` and are trained after `set.seed(624)`; together this guarantees identical CV folds, which is what `resamples()` needs for valid model comparison later.
+- Per-model output pattern is documented above; each section appends one row to `model_metrics` so the final comparison table builds itself as we go.
+
+## Linear baseline
+
+> Recap located at the end of the section. Skip there to jump past the code/workflow.
+
+First model: ordinary linear regression. Mostly useful as a floor for later models to beat.
+
+**Numeric pre-processing.** Inside the `train()` call, we use YeoJohnson rather than Box-Cox because four predictors in the narrow set (`Mnf.Flow`, `Hyd.Pressure2`, `PSC.Fill`, `PSC.CO2`) have non-positive values. Box-Cox would silently skip those columns; YeoJohnson handles the full real line. After YeoJohnson, predictors are centered, scaled, and KNN-imputed inside each CV fold.
+
+### Linear regression (lm)
+
+```{r}
+set.seed(624)
+
+lm_model <- train(
+  PH ~ .,
+  data = training_for_modeling,
+  method = "lm",
+  trControl = controlObject,
+  preProcess = c("YeoJohnson", "center", "scale", "knnImpute"),
+  na.action = na.pass
+)
+
+models$lm <- lm_model
+
+# append CV metrics to the running comparison table
+model_metrics <- bind_rows(
+  model_metrics,
+  getTrainPerf(lm_model) %>%
+    transmute(model = "lm",
+              cv_RMSE = TrainRMSE,
+              cv_Rsquared = TrainRsquared,
+              cv_MAE = TrainMAE)
+)
+
+lm_model
+```
+
+**Variable importance.** Which predictors matter most for PH under linear assumptions.
+
+```{r}
+plot(varImp(lm_model), top = 20)
+```
+
+**Coefficients.** Sign and magnitude give direction and strength of each predictor's effect on PH (positive coefficient = predictor increases PH, negative = decreases PH). Sorted by absolute t-statistic.
+
+```{r}
+lm_coefs <- summary(lm_model$finalModel)$coefficients %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column("predictor") %>%
+  arrange(desc(abs(`t value`)))
+kable(lm_coefs, digits = 4)
+```
+
+**Residual summary.** Out-of-fold residual stats and a quick check on how well predicted values cover the observed PH range.
+
+```{r}
+lm_preds <- lm_model$pred
+lm_preds$residual <- lm_preds$obs - lm_preds$pred
+
+residual_summary <- tibble(
+  metric = c("Mean residual",
+             "SD residual",
+             "Max |residual|",
+             "99th pct |residual|",
+             "Cor(predicted, residual)",
+             "Predicted PH range",
+             "Observed PH range"),
+  value = c(
+    sprintf("%.5f", mean(lm_preds$residual)),
+    sprintf("%.4f", sd(lm_preds$residual)),
+    sprintf("%.4f", max(abs(lm_preds$residual))),
+    sprintf("%.4f", quantile(abs(lm_preds$residual), 0.99)),
+    sprintf("%.4f", cor(lm_preds$pred, lm_preds$residual)),
+    sprintf("%.3f to %.3f", min(lm_preds$pred), max(lm_preds$pred)),
+    sprintf("%.3f to %.3f", min(lm_preds$obs), max(lm_preds$obs))
+  )
+)
+kable(residual_summary)
+```
+
+### Recap
+
+- Linear regression baseline trained via 10-fold CV repeated 5 times. Fitted model stored in `models$lm`, CV metrics appended to `model_metrics`.
+- Cross-validated RMSE ~0.135, R-squared ~0.38, MAE ~0.106. Residuals are mean-zero and uncorrelated with predicted values; the model is well-calibrated for what it can do.
+- Predicted PH range (8.24 to 8.83) is much narrower than observed (7.88 to 8.94). The linear model regresses to the mean and can't reach the tails of the PH distribution; nonlinear models should improve on this.
+- Top predictive factors (largest absolute t-statistics): `Mnf.Flow` (dominant), `Carb.Pressure1`, `Brand.CodeD`, `Filler.Level`, `Brand.CodeC`, `Usage.cont`, `Hyd.Pressure2`, `Temperature`.
+- Coefficient directions for business interpretation: higher `Mnf.Flow`, `Usage.cont`, `Temperature`, and `Oxygen.Filler` push PH down; higher `Carb.Pressure1`, `Filler.Level`, and `Hyd.Pressure2` push PH up. Brand D has the highest baseline PH, Brand C the lowest, with a spread of about 0.07 PH units between them.
+
+## Model comparison
+
+> Fills in once we have more than one model in `models`. Until then this section is a scaffold.
+
+All models share `controlObject` and were trained immediately after `set.seed(624)`, so the CV folds are identical across them. That lets us compare on the same resampling structure via `resamples()`.
+
+```{r, eval=FALSE}
+# Uncomment once `models` has more than one entry
+resamps <- resamples(models)
+
+# Per-model distribution of CV RMSE, R-squared, MAE
+summary(resamps)
+
+# Side-by-side boxplots of per-fold RMSE; lower median is better, narrow box is more stable
+bwplot(resamps, metric = "RMSE")
+
+# Means with confidence intervals for RMSE and R-squared
+dotplot(resamps, metric = c("RMSE", "Rsquared"))
+
+# Sorted comparison table from the running metrics
+kable(model_metrics %>% arrange(cv_RMSE))
+
+# Optional: pairwise paired t-tests on the resampled metrics
+# diff(resamps) %>% summary()
+```
+
+### Recap
+
+- Final model pick and the reasoning behind it go here once we have all candidates trained.
+
+## Evaluation set predictions
+
+> Fills in once a final model is picked.
+
+The deliverable requires predictions on the eval set (`test_data_imputed`) in Excel format. We apply the chosen model with consistent feature engineering (Brand.Code factor levels aligned with the model's training levels) and write to xlsx.
+
+```{r, eval=FALSE}
+# Uncomment and adjust once the final model is picked
+# final_model <- models$<chosen>
+#
+# # align eval set Brand.Code factor levels with the model's training levels
+# eval_for_prediction <- test_data_imputed %>%
+#   mutate(Brand.Code = factor(
+#     ifelse(is.na(Brand.Code) | Brand.Code == "", "Unknown", Brand.Code),
+#     levels = levels(training_for_modeling$Brand.Code)
+#   ))
+#
+# eval_predictions <- predict(final_model, newdata = eval_for_prediction)
+#
+# output_df <- tibble(row = seq_along(eval_predictions),
+#                     PH = eval_predictions)
+# writexl::write_xlsx(output_df, file.path(projPath, "abc_beverage_PH_predictions.xlsx"))
+```
+
+### Recap
+
+- Fill in once the final model is determined.
+
+## Business takeaways (Informal)
+
+The non-technical report needs these for ABC Beverage leadership:
+
+1. **The model.** We can predict PH from the manufacturing variables. Best cross-validated RMSE will be in `model_metrics` after the final model is picked.
+2. **The factors.** Which manufacturing controls drive PH the most, and in which direction. Top candidates from the linear baseline so far: `Mnf.Flow` (largest single lever; lower flow correlates with higher PH), `Carb.Pressure1`, `Filler.Level`, `Brand.Code`, `Usage.cont`, `Hyd.Pressure2`, `Temperature`. Brand effects span about 0.07 PH units, with Brand D highest and Brand C lowest.
+3. **The recommendation.** Tighter operational tolerances and sensor monitoring on the top 3-4 predictors (or you could call them levers); each brand should get its own production targets since `Brand.Code` is consistently one of the top predictors of PH (the right settings for Brand A probably aren't the right settings for Brand D).
+
+### Recap
+
+- Fill in fully once the final model is determined
