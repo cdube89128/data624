@@ -37,7 +37,9 @@ pacman::p_load(
    caret,
    RANN,
    glmnet,
-   randomForest
+   randomForest,
+   gbm,
+   kernlab
 )
 
 projPath <- if (interactive()) {
@@ -540,13 +542,13 @@ sum(is.na(test_data_imputed))
 - Evaluation set: kept all 267 rows including one with 8 predictor NAs out of 20 (originally 14 before column drops); imputed predictor columns only with VIM `kNN(k = 5)` (leaving `PH` blank since that's what we predict) -> `test_data_imputed`. The sparse row gets imputed too but will be flagged as low-confidence in the final prediction output.
 - Both sets are now fully imputed (apart from `PH` in the eval set) and ready for modeling
 
-## Break into training and test data
+## Break into training and test data (inspection only, not used downstream)
 
 > Recap located at the end of the section. Skip there to jump past the code/workflow.
 
-Breaking the training data set into an 80%/20% training and test set:
+Originally this section produced an 80/20 split for a quick sanity check on the data. The modeling pipeline below uses 10-fold CV on the full `training_data_no_na` instead, so the `train_x` / `test_x` objects below aren't downstream of anything. The chunk is set to `eval=FALSE` so it doesn't run on knit, but the code is kept here as a historical reference.
 
-```{r train-test-split}
+```{r train-test-split, eval=FALSE}
 set.seed(624)
 
 train_index <- sample(nrow(training_data_imputed),
@@ -567,8 +569,8 @@ I did not scale anything individually, every package should have an option to ce
 
 ### Recap
 
-- Split `training_data_imputed` 80/20 via `sample()` with `set.seed(624)`, producing `train_x` / `train_y` (80%) and `test_x` / `test_y` (20%)
-- Centering, scaling, and Box-Cox transformations left to per-model `preProc` options rather than baked in here
+- The 80/20 split chunk above is `eval=FALSE` and is kept only as a historical reference. The modeling pipeline uses 10-fold CV on `training_data_no_na` directly, so `train_x` / `test_x` etc. are not created on knit.
+- Centering, scaling, and Box-Cox transformations are handled inside each model's `preProc` options rather than baked in here.
 
 ## Modeling approach
 
@@ -635,7 +637,7 @@ First model: ordinary linear regression. Mostly useful as a floor for later mode
 
 ### Linear regression (lm)
 
-```{r fit-lm}
+```{r fit-lm, cache=TRUE}
 set.seed(624)
 
 lm_model <- train(
@@ -721,7 +723,7 @@ Next model we're trying: elastic net via `glmnet`. This seemed like a good optio
 
 ### Elastic net (glmnet)
 
-```{r fit-elastic-net}
+```{r fit-elastic-net, cache=TRUE}
 set.seed(624)
 
 elastic_model <- train(
@@ -819,7 +821,7 @@ training_for_modeling_wide <- training_data_wide_no_na %>%
 
 ### Random forest
 
-```{r fit-random-forest}
+```{r fit-random-forest, cache=TRUE}
 set.seed(624)
 
 rf_model <- train(
@@ -885,18 +887,174 @@ kable(residual_summary_rf)
 ### Recap
 
 - Random forest trained via 10-fold CV, on the wider 31-predictor feature set. Fitted model stored in `models$random_forest`, CV metrics appended to `model_metrics`.
-- (After knit:) Tuned `mtry` and how it compares to caret's default heuristic (`p/3`). Headline CV metrics.
-- (After knit:) Top predictive factors from varImp; comparison to the linear-family top predictors will tell us if Mnf.Flow remains dominant or if the wider feature set surfaces something different.
-- (After knit:) Whether the predicted PH range expands compared to the linear models (it should; that's the whole point of going nonlinear).
+- Tuned `mtry = 26` (out of candidates 2, 10, 18, 26, 34). caret's default heuristic for regression is `p/3` (about 11 for our wider set), so the data preferred sampling more predictors per split than the default. Performance was nearly flat between mtry = 26 and 34.
+- CV metrics: RMSE 0.0926, R-squared 0.7177, MAE 0.0672. About a third off the linear-family RMSE and nearly doubling R-squared.
+- Top predictive factors: Brand.CodeC (100) and Mnf.Flow (99) nearly tied at the top, then Pressure.Vacuum (72), Oxygen.Filler (72), Air.Pressurer (61), Alch.Rel (60), Balling.Lvl (57), Temperature (52). Several of these (Pressure.Vacuum, Alch.Rel, Balling.Lvl, Carb.Rel) were dropped from the narrow set during the correlation prune, so the wider feature set is doing real work.
+- Random forest's predictions span PH values from 8.11 to 8.83, wider than the linear models did (8.24 to 8.83). The actual observed PH values span 7.88 to 8.94, wider still. So random forest gets closer to the extreme PH values than the linear models, but it still can't quite reach them; it leans toward predicting middle-of-the-pack values when the truth is at the edges.
+- There's a small systematic pattern in random forest's errors: when the model predicts a higher PH, the truth tends to be even higher; when it predicts a lower PH, the truth tends to be even lower. The correlation between predicted and error is 0.169, small but not zero. Same idea as the range-issue above (the model leans toward middle predictions), just less severe than what the linear models showed.
+
+## Gradient boosting
+
+> Recap located at the end of the section. Skip there to jump past the code/workflow.
+
+Next tree-based model: gradient boosted regression trees via `gbm`, wrapped by caret. gbm fits a sequence of shallow trees where each tree corrects the previous tree's residuals; the additive ensemble tends to edge out random forest on tabular data with moderate complexity. Like RF, gbm doesn't need scaling or Box-Cox, and it uses the wider 31-predictor feature set so it can use the variables we pruned out for the linear-family models.
+
+### Gradient boosting (gbm)
+
+```{r fit-gradient-boosting, cache=TRUE}
+set.seed(624)
+
+gbm_model <- train(
+  PH ~ .,
+  data = training_for_modeling_wide,
+  method = "gbm",
+  trControl = controlObject,
+  preProcess = c("knnImpute"),
+  na.action = na.pass,
+  tuneLength = 5,
+  verbose = FALSE
+)
+
+models$gbm <- gbm_model
+
+# append CV metrics to the running comparison table
+model_metrics <- bind_rows(
+  model_metrics,
+  getTrainPerf(gbm_model) %>%
+    transmute(model = "gbm",
+              cv_RMSE = TrainRMSE,
+              cv_Rsquared = TrainRsquared,
+              cv_MAE = TrainMAE)
+)
+
+gbm_model
+```
+
+**Variable importance.**
+
+```{r gbm-varimp}
+plot(varImp(gbm_model), top = 20)
+```
+
+**Residual summary.**
+
+```{r gbm-residuals}
+gbm_preds <- gbm_model$pred
+gbm_preds$residual <- gbm_preds$obs - gbm_preds$pred
+
+residual_summary_gbm <- tibble(
+  metric = c("Mean residual",
+             "SD residual",
+             "Max |residual|",
+             "99th pct |residual|",
+             "Cor(predicted, residual)",
+             "Predicted PH range",
+             "Observed PH range"),
+  value = c(
+    sprintf("%.5f", mean(gbm_preds$residual)),
+    sprintf("%.4f", sd(gbm_preds$residual)),
+    sprintf("%.4f", max(abs(gbm_preds$residual))),
+    sprintf("%.4f", quantile(abs(gbm_preds$residual), 0.99)),
+    sprintf("%.4f", cor(gbm_preds$pred, gbm_preds$residual)),
+    sprintf("%.3f to %.3f", min(gbm_preds$pred), max(gbm_preds$pred)),
+    sprintf("%.3f to %.3f", min(gbm_preds$obs), max(gbm_preds$obs))
+  )
+)
+kable(residual_summary_gbm)
+```
+
+### Recap
+
+- Gradient boosting trained via 10-fold CV on the wider 31-predictor feature set. Fitted model stored in `models$gbm`, CV metrics appended to `model_metrics`.
+- We tuned gradient boosting (gbm) by testing combinations of tree depth (1 through 5) and number of trees (50 through 250). The best combination turned out to be the largest values we tested: depth 5 and 250 trees. Performance was still improving as we increased both, meaning gradient boosting might have done even better if we had tested even bigger settings. We didn't expand the search though, because even at these settings gradient boosting did not perform as well as random forest, and the gap was too large for a wider search to close.
+- CV metrics: RMSE 0.1073, R-squared 0.6118, MAE 0.0810. Better than the linear family but notably behind random forest.
+- Top predictive factors are mostly the same set as random forest in a different order: Mnf.Flow (100, top), Usage.cont (34), Brand.CodeC (33), Alch.Rel (31), Pressure.Vacuum (24), Temperature (23), Oxygen.Filler (22), Carb.Pressure1 (18). The Mnf.Flow + Brand + Pressure.Vacuum + Alch.Rel + Oxygen + Temperature cluster stays consistent with random forest.
+- Predicted PH range: 8.15 to 8.88 vs observed 7.88 to 8.94. Slightly wider than random forest (8.11 to 8.83) at the upper end. Residuals are nearly mean-zero and uncorrelated with predicted values (correlation 0.028), so gradient boosting is well-calibrated.
+
+## Support vector machine (radial kernel)
+
+> Recap located at the end of the section. Skip there to jump past the code/workflow.
+
+Adding a nonlinear non-tree model to round out the family lineup: support vector machine with a radial basis function (RBF) kernel via `kernlab`, wrapped by caret. SVM-radial is sensitive to scaling so it uses the narrow feature set with the same preProcess pipeline as the linear-family models (YeoJohnson, center, scale, knnImpute). Unlike trees, SVM doesn't natively output variable importance; caret falls back to a filter-based metric (LOESS pseudo-R-squared on each predictor).
+
+### SVM-radial (svmRadial)
+
+```{r fit-svm-radial, cache=TRUE}
+set.seed(624)
+
+svm_model <- train(
+  PH ~ .,
+  data = training_for_modeling,
+  method = "svmRadial",
+  trControl = controlObject,
+  preProcess = c("YeoJohnson", "center", "scale", "knnImpute"),
+  na.action = na.pass,
+  tuneLength = 10
+)
+
+models$svm_radial <- svm_model
+
+# append CV metrics to the running comparison table
+model_metrics <- bind_rows(
+  model_metrics,
+  getTrainPerf(svm_model) %>%
+    transmute(model = "svm_radial",
+              cv_RMSE = TrainRMSE,
+              cv_Rsquared = TrainRsquared,
+              cv_MAE = TrainMAE)
+)
+
+svm_model
+```
+
+**Variable importance.** (Filter-based since SVM doesn't have native importance.)
+
+```{r svm-varimp}
+plot(varImp(svm_model), top = 20)
+```
+
+**Residual summary.**
+
+```{r svm-residuals}
+svm_preds <- svm_model$pred
+svm_preds$residual <- svm_preds$obs - svm_preds$pred
+
+residual_summary_svm <- tibble(
+  metric = c("Mean residual",
+             "SD residual",
+             "Max |residual|",
+             "99th pct |residual|",
+             "Cor(predicted, residual)",
+             "Predicted PH range",
+             "Observed PH range"),
+  value = c(
+    sprintf("%.5f", mean(svm_preds$residual)),
+    sprintf("%.4f", sd(svm_preds$residual)),
+    sprintf("%.4f", max(abs(svm_preds$residual))),
+    sprintf("%.4f", quantile(abs(svm_preds$residual), 0.99)),
+    sprintf("%.4f", cor(svm_preds$pred, svm_preds$residual)),
+    sprintf("%.3f to %.3f", min(svm_preds$pred), max(svm_preds$pred)),
+    sprintf("%.3f to %.3f", min(svm_preds$obs), max(svm_preds$obs))
+  )
+)
+kable(residual_summary_svm)
+```
+
+### Recap
+
+- SVM-radial trained via 10-fold CV on the narrow 20-predictor feature set with full preProcess pipeline (YeoJohnson, center, scale, knnImpute). Fitted model stored in `models$svm_radial`, CV metrics appended to `model_metrics`.
+- Support vector machine (SVM) has a parameter called C that controls how complex the model gets. We tested C values from 0.25 to 128 (each one twice as big as the last). The best C turned out to be 2, which sits in the middle of the values we tested. That's a good sign: if the best C had been at either extreme of the range, we'd worry we didn't search wide enough. Sigma (the parameter that controls the radial kernel) was held constant at 0.028.
+- CV metrics: RMSE 0.1228, R-squared 0.4944, MAE 0.0920. Between the linear models and the tree-based models. The radial kernel (which lets SVM fit curved relationships instead of just straight lines) gets it past the linear models, but SVM is a single model while random forest and gradient boosting each combine many trees, which is the main reason those two outperform SVM here.
+- Top predictive factors via LOESS pseudo-R-squared (SVM's filter-based importance, not native): Mnf.Flow (100), Usage.cont (92), Oxygen.Filler (87), Filler.Level (66), Filler.Speed (61), PC.Volume (47), Hyd.Pressure2 (44), Fill.Pressure (43), Brand.Code (31), Carb.Pressure1 (30). Note this measures individual predictor strength against PH, not contribution to the SVM model itself.
+- Predicted PH range: 8.18 to 8.86 vs observed 7.88 to 8.94. Similar compression pattern to the other models. Mean residual is slightly off zero (-0.0079), a touch more than the other models but not enough to suggest systematic bias.
 
 ## Model comparison
 
-> Fill in once we have more than one model in `models`. 
+> Recap located at the end of the section. Skip there to jump past the code/workflow.
 
-All models share `controlObject` and were trained immediately after `set.seed(624)`, so the CV folds are identical across them. That lets us compare on the same resampling structure via `resamples()`.
+All five models trained on the same shared CV folds. Comparing on identical resampling structure via `resamples()`:
 
-```{r resamples-comparison, eval=FALSE}
-# Uncomment once `models` has more than one entry
+```{r resamples-comparison}
 resamps <- resamples(models)
 
 # Per-model distribution of CV RMSE, R-squared, MAE
@@ -910,14 +1068,16 @@ dotplot(resamps, metric = c("RMSE", "Rsquared"))
 
 # Sorted comparison table from the running metrics
 kable(model_metrics %>% arrange(cv_RMSE))
-
-# Optional: pairwise paired t-tests on the resampled metrics
-# diff(resamps) %>% summary()
 ```
 
 ### Recap
 
-- Final model pick and the reasoning behind it go here once we have all candidates trained.
+- Five models trained: linear regression (lm), elastic net, random forest (RF), gradient boosting (gbm), and support vector machine with radial kernel (SVM-radial). Ranked by cross-validated RMSE: random forest (0.093) < gradient boosting (0.107) < SVM-radial (0.123) < elastic net (0.135) ~= linear regression (0.135).
+- **Random forest wins** with cross-validated RMSE 0.0926, R-squared 0.7177, MAE 0.0672. It cuts the linear-family RMSE by about a third and almost doubles R-squared.
+- Gradient boosting (gbm) comes in second (RMSE 0.107, R-squared 0.612). It performed better than the linear models and SVM-radial but did not match random forest. The tuning landed at the largest settings we tested, meaning gradient boosting might keep improving with more tuning room, but the gap to random forest is large enough that we did not pursue it further.
+- SVM-radial sits between the linear and tree-based models (RMSE 0.123, R-squared 0.494). The radial kernel lets it fit curved relationships, which helps over the linear models. But SVM-radial is a single model while random forest and gradient boosting each combine many trees into one prediction, which is the main reason those tree-based methods outperform SVM-radial here.
+- Linear regression (lm) and elastic net are essentially tied at the bottom (RMSE 0.135, R-squared 0.38). The linear family probably cannot improve further on this dataset; elastic net's tuning confirmed there's no useful coefficient shrinkage to extract beyond what plain linear regression already finds.
+- **Pick: random forest.** It's the clear leader, generalizes well, and provides strong variable importance for the business writeup.
 
 ## Evaluation set predictions
 
@@ -951,9 +1111,13 @@ The deliverable requires predictions on the eval set (`test_data_imputed`) in Ex
 
 The non-technical report needs these for ABC Beverage leadership:
 
-1. **The model.** We can predict PH from the manufacturing variables. Best cross-validated RMSE will be in `model_metrics` after the final model is picked.
-2. **The factors.** Which manufacturing controls drive PH the most, and in which direction. Top candidates from the linear baseline so far: `Mnf.Flow` (largest single lever; lower flow correlates with higher PH), `Carb.Pressure1`, `Filler.Level`, `Brand.Code`, `Usage.cont`, `Hyd.Pressure2`, `Temperature`. Brand effects span about 0.07 PH units, with Brand D highest and Brand C lowest.
-3. **The recommendation.** Tighter operational tolerances and sensor monitoring on the top 3-4 predictors (or you could call them levers); each brand should get its own production targets since `Brand.Code` is consistently one of the top predictors of PH (the right settings for Brand A probably aren't the right settings for Brand D).
+1. **The model.** Random forest is our chosen final model with cross-validated RMSE 0.093, R-squared 0.72, MAE 0.067. That's substantially better than the linear family (linear regression and elastic net both at RMSE 0.135, R-squared 0.38). Of the five models we tried, random forest was a clear leader; gradient boosting came in second but did not perform as well.
+2. **The factors.** Consistent themes across all five models:
+   - `Mnf.Flow`: the single most predictive variable across every model. Lower flow correlates with higher PH.
+   - `Brand.Code`: a real driver. Random forest emphasizes Brand C (lowest baseline PH); linear models pick up Brand D too. Either way, the brand a beverage is made under has a measurable effect on PH.
+   - `Pressure.Vacuum`, `Alch.Rel`, `Balling.Lvl`, `Carb.Rel`, `Oxygen.Filler`: surface as important in the tree-based models. Several of these were dropped from the linear-family models due to collinearity, so they're "new" levers that pure linear analysis would have missed.
+   - `Temperature` and `Usage.cont`: appear at or near the top of every model.
+3. **The recommendation.** Tighter operational tolerances and sensor monitoring on the top 3-4 predictors (or you could call them levers); each brand should get its own production targets since `Brand.Code` is consistently one of the top predictors of PH (the right settings for Brand A probably aren't the right settings for Brand D). For our random-forest-driven recommendation specifically: focus on `Mnf.Flow`, `Brand.Code`-aware standards, `Pressure.Vacuum`, `Oxygen.Filler`, and `Alch.Rel`.
 
 ### Recap
 
