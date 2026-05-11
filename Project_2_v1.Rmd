@@ -580,11 +580,11 @@ Before fitting models, a few setup decisions worth flagging up front.
 
 **Per-model feature sets.** As covered in the data cleaning section, linear-family and neural-network models use the correlation-pruned 20-predictor set (`training_data_no_na`). Tree-based and rule-based models use the wider 31-predictor set (`training_data_wide_no_na`). The reasoning is in the cleaning section's notes.
 
-**Imputation inside resampling.** The earlier `kNN(k = 5)` chunk produced `training_data_imputed` as a one-time inspection step, useful for seeing what imputation does to the data and for the quick 80/20 sanity-check split. For the actual model fitting, however, we start from `training_data_no_na` (the pre-imputation intermediate) and let caret handle imputation inside each CV fold via `preProcess(method = c("knnImpute", "BoxCox", "center", "scale"))` paired with `trainControl(method = "repeatedcv", number = 10, repeats = 5)`. That way the imputation parameters are estimated per fold rather than once on the full training set, which avoids the small bias from imputing before the split.
+**Imputation inside resampling.** The earlier `kNN(k = 5)` chunk produced `training_data_imputed` as a one-time inspection step, useful for seeing what imputation does to the data and for the quick 80/20 sanity-check split. For the actual model fitting, however, we start from `training_data_no_na` (the pre-imputation intermediate) and let caret handle imputation inside each CV fold via `preProcess(method = c("YeoJohnson", "center", "scale", "knnImpute"))` paired with `trainControl(method = "cv", number = 10)`. That way the imputation parameters are estimated per fold rather than once on the full training set, which avoids the small bias from imputing before the split.
 
 **Brand.Code handling.** Rather than imputing the 120 missing brand values, we treat missing as its own factor level called `"Unknown"`. The EDA section established that the missing-Brand rows have a different PH profile from known-Brand rows, so the missingness itself carries signal worth preserving.
 
-**Shared infrastructure for the model comparison.** Every model we fit shares the same `controlObject` (10-fold CV, 5 repeats) and is trained immediately after `set.seed(624)`. Together that guarantees identical CV folds across models, which is what `resamples()` requires for valid side-by-side comparisons later. Each fitted model also gets appended to a `models` list so the final comparison can drop in cleanly.
+**Shared infrastructure for the model comparison.** Every model we fit shares the same `controlObject` (10-fold CV) and is trained immediately after `set.seed(624)`. Together that guarantees identical CV folds across models, which is what `resamples()` requires for valid side-by-side comparisons later. Each fitted model also gets appended to a `models` list so the final comparison can drop in cleanly.
 
 ```{r setup-modeling}
 library(caret)
@@ -707,7 +707,7 @@ kable(residual_summary)
 
 ### Recap
 
-- Linear regression baseline trained via 10-fold CV repeated 5 times. Fitted model stored in `models$lm`, CV metrics appended to `model_metrics`.
+- Linear regression baseline trained via 10-fold CV. Fitted model stored in `models$lm`, CV metrics appended to `model_metrics`.
 - Cross-validated RMSE ~0.135, R-squared ~0.38, MAE ~0.106. Residuals are mean-zero and uncorrelated with predicted values; the model is well-calibrated for what it can do.
 - Predicted PH range (8.24 to 8.83) is much narrower than observed (7.88 to 8.94). The linear model regresses to the mean and can't reach the tails of the PH distribution; nonlinear models should improve on this.
 - Top predictive factors (largest absolute t-statistics): `Mnf.Flow` (dominant), `Carb.Pressure1`, `Brand.CodeD`, `Filler.Level`, `Brand.CodeC`, `Usage.cont`, `Hyd.Pressure2`, `Temperature`.
@@ -798,7 +798,7 @@ kable(residual_summary_elastic)
 
 ### Recap
 
-- Elastic net trained via 10-fold CV repeated 5 times, with caret tuning over alpha (0 = ridge, 1 = lasso) and lambda. Fitted model stored in `models$elastic_net`, CV metrics appended to `model_metrics`.
+- Elastic net trained via 10-fold CV, with caret tuning over alpha (0 = ridge, 1 = lasso) and lambda. Fitted model stored in `models$elastic_net`, CV metrics appended to `model_metrics`.
 - Tuned to alpha = 0.2 (mostly ridge with a sliver of lasso) and lambda = 0.0010 (very small). The data didn't want much regularization at all; elastic net essentially landed on "lm with a faint ridge nudge."
 - CV metrics are nearly identical to lm: RMSE ~0.1354, R-squared ~0.381, MAE ~0.106. The penalized linear family has hit its ceiling on this dataset.
 - Same top predictors in the same order as lm, with coefficients shrunk slightly toward zero. Only `Carb.Pressure` got zeroed out by the lasso component (in lm it had p = 0.96 and a near-zero estimate, so this is the right call).
@@ -884,7 +884,7 @@ kable(residual_summary_rf)
 
 ### Recap
 
-- Random forest trained via 10-fold CV repeated 5 times, on the wider 31-predictor feature set. Fitted model stored in `models$random_forest`, CV metrics appended to `model_metrics`.
+- Random forest trained via 10-fold CV, on the wider 31-predictor feature set. Fitted model stored in `models$random_forest`, CV metrics appended to `model_metrics`.
 - (After knit:) Tuned `mtry` and how it compares to caret's default heuristic (`p/3`). Headline CV metrics.
 - (After knit:) Top predictive factors from varImp; comparison to the linear-family top predictors will tell us if Mnf.Flow remains dominant or if the wider feature set surfaces something different.
 - (After knit:) Whether the predicted PH range expands compared to the linear models (it should; that's the whole point of going nonlinear).
