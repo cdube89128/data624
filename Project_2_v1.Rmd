@@ -1081,31 +1081,83 @@ kable(model_metrics %>% arrange(cv_RMSE))
 
 ## Evaluation set predictions
 
-> Fill in once a final model is picked.
+> Recap located at the end of the section. Skip there to jump past the code/workflow.
 
-The deliverable requires predictions on the eval set (`test_data_imputed`) in Excel format. We apply the chosen model with consistent feature engineering (Brand.Code factor levels aligned with the model's training levels) and write to xlsx.
+The deliverable requires predictions on the evaluation set. Right now we have this set up to pick the best model from `model_metrics`  based on the lowest CV RMSE. The chunk prepares the evaluation set with the correct feature set and `Brand.Code` factor levels, predict, and write to CSV. As (or if) we add more models to compare in the future, we just want to make sure the new model's name is added to the `model_feature_set` mapping inside the chunk so it knows whether to use the narrow or wide evaluation set.
 
-```{r eval-set-predictions, eval=FALSE}
-# Uncomment and adjust once the final model is picked
-# final_model <- models$<chosen>
-#
-# # align eval set Brand.Code factor levels with the model's training levels
-# eval_for_prediction <- test_data_imputed %>%
-#   mutate(Brand.Code = factor(
-#     ifelse(is.na(Brand.Code) | Brand.Code == "", "Unknown", Brand.Code),
-#     levels = levels(training_for_modeling$Brand.Code)
-#   ))
-#
-# eval_predictions <- predict(final_model, newdata = eval_for_prediction)
-#
-# output_df <- tibble(row = seq_along(eval_predictions),
-#                     PH = eval_predictions)
-# writexl::write_xlsx(output_df, file.path(projPath, "abc_beverage_PH_predictions.xlsx"))
+```{r eval-set-predictions}
+# Find the best model by cross-validated RMSE
+best_model_name <- model_metrics %>%
+  arrange(cv_RMSE) %>%
+  slice(1) %>%
+  pull(model)
+
+best_model <- models[[best_model_name]]
+
+cat("Best model selected:", best_model_name, "\n")
+cat("CV RMSE:", round(model_metrics %>% filter(model == best_model_name) %>% pull(cv_RMSE), 4), "\n")
+
+# Map each model to which feature set it was trained on. If we ADD A NEW MODEL
+# must also add an entry here so the eval set gets prepared with the right column
+model_feature_set <- c(
+  lm = "narrow",
+  elastic_net = "narrow",
+  svm_radial = "narrow",
+  random_forest = "wide",
+  gbm = "wide"
+)
+
+if (!best_model_name %in% names(model_feature_set)) {
+  warning("Best model '", best_model_name, "' is not in the model_feature_set mapping. ",
+          "Defaulting to wide; if that's wrong, update the mapping in this chunk.")
+  feature_set_choice <- "wide"
+} else {
+  feature_set_choice <- model_feature_set[[best_model_name]]
+}
+
+# Prepare the eval set with the right features and Brand.Code level alignment
+if (feature_set_choice == "narrow") {
+  eval_for_prediction <- test_data_imputed %>%
+    mutate(Brand.Code = factor(
+      ifelse(is.na(Brand.Code) | Brand.Code == "", "Unknown", as.character(Brand.Code)),
+      levels = levels(training_for_modeling$Brand.Code)
+    ))
+} else {
+  eval_for_prediction <- test_data_wide %>%
+    mutate(Brand.Code = factor(
+      ifelse(is.na(Brand.Code) | Brand.Code == "", "Unknown", as.character(Brand.Code)),
+      levels = levels(training_for_modeling_wide$Brand.Code)
+    ))
+}
+
+# Predict
+eval_predictions <- predict(best_model, newdata = eval_for_prediction, na.action = na.pass)
+
+# Flag rows that were sparse in the original eval data (predictor NAs only)
+original_predictor_nas <- rowSums(is.na(test_data %>% select(-PH)))
+
+# Build the output data frame
+predictions_output <- tibble(
+  row_id = seq_along(eval_predictions),
+  Brand.Code = as.character(eval_for_prediction$Brand.Code),
+  predicted_PH = round(eval_predictions, 4),
+  notes = ifelse(original_predictor_nas >= 5,
+                 paste0("low confidence: original row had ", original_predictor_nas, " predictor NAs"),
+                 "")
+)
+
+# Write CSV alongside the rmd
+write_csv(predictions_output, file.path(projPath, "abc_beverage_PH_predictions.csv"))
+
+# Show the first few rows for confirmation
+head(predictions_output)
 ```
 
 ### Recap
 
-> Fill in once the final model is determined.
+- Predictions for the evaluation set are written to `abc_beverage_PH_predictions.csv` in the project root. The output has four columns: `row_id`, `Brand.Code`, `predicted_PH`, and a `notes` column that flags rows where the original evaluation data had 5+ predictor NAs (these predictions lean heavily on imputed values).
+- The chunk picks the best model dynamically by lowest CV RMSE in `model_metrics`. Currently that's random forest.
+- Adding a new model in the future just means appending an entry to `model_feature_set` inside the chunk (narrow or wide); the chunk picks up whichever model has the lowest CV RMSE.
 
 ## Business takeaways (Informal)
 
